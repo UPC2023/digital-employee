@@ -181,23 +181,75 @@ def parse_resume_text(resume_text: str) -> dict:
 
     llm = get_llm_client()
 
-    # 使用 structured output
-    structured_llm = llm.with_structured_output(ResumeInfo)
-
     messages = [
-        SystemMessage(content="你是专业的简历解析专家，请严格按照要求提取简历中的结构化信息。"),
+        SystemMessage(content="你是专业的简历解析专家，请严格按照要求提取简历中的结构化信息。你必须返回合法的JSON格式。"),
         HumanMessage(content=RESUME_EXTRACTION_PROMPT.format(resume_text=resume_text)),
     ]
 
+    # 先尝试 structured output
     try:
+        structured_llm = llm.with_structured_output(ResumeInfo)
         result: ResumeInfo = structured_llm.invoke(messages)
         return result.model_dump()
     except Exception as e:
-        # 如果 Structured Output 失败，回退到普通调用 + 手动解析
         print(f"[WARN] Structured Output 失败，尝试普通解析: {e}")
-        response = llm.invoke(messages)
-        # 返回原始响应
-        return {"_raw_response": response.content, "_error": str(e)}
+
+    # 回退：普通调用 + 手动 JSON 解析
+    import json
+    json_prompt = """请从以下简历文本中提取信息，严格按照以下JSON格式返回（不要包含其他文字，不要用markdown代码块）：
+
+{
+  "name": "姓名",
+  "phone": "手机号",
+  "email": "邮箱",
+  "education": [{"school": "学校", "major": "专业", "degree": "学历", "start_date": "开始日期", "end_date": "结束日期"}],
+  "work_experience": [{"company": "公司", "position": "职位", "start_date": "开始日期", "end_date": "结束日期", "description": "工作描述"}],
+  "skills": ["技能1", "技能2"],
+  "self_evaluation": "自我评价",
+  "expected_salary": "期望薪资",
+  "current_salary": "当前薪资"
+}
+
+找不到的字段留空字符串或空列表。
+
+简历文本：
+""" + resume_text[:3000]
+
+    try:
+        response = llm.invoke([
+            SystemMessage(content="你是简历解析助手，只返回JSON，不要其他文字。"),
+            HumanMessage(content=json_prompt),
+        ])
+        content = response.content.strip()
+        # 去除可能的 markdown 代码块标记
+        if content.startswith("```"):
+            content = content.split("\n", 1)[1] if "\n" in content else content[3:]
+        if content.endswith("```"):
+            content = content[:-3]
+        content = content.strip()
+        
+        data = json.loads(content)
+        # 确保必要字段存在
+        data.setdefault("name", "")
+        data.setdefault("phone", "")
+        data.setdefault("email", "")
+        data.setdefault("education", [])
+        data.setdefault("work_experience", [])
+        data.setdefault("skills", [])
+        data.setdefault("self_evaluation", "")
+        return data
+    except Exception as e:
+        print(f"[ERROR] JSON 解析也失败: {e}")
+        return {
+            "name": "",
+            "phone": "",
+            "email": "",
+            "education": [],
+            "work_experience": [],
+            "skills": [],
+            "self_evaluation": "",
+            "_error": str(e),
+        }
 
 
 # ============================================================
