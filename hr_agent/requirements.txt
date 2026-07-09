@@ -1,0 +1,33 @@
+# HR Agent 项目依赖
+# 安装方式: pip install -r requirements.txt
+
+# 前端框架
+gradio>=4.0.0
+
+# 核心框架
+langchain>=0.3.0
+langchain-core>=0.3.0
+langchain-openai>=0.2.0
+langchain-community>=0.3.0
+pydantic>=2.0
+
+# 数据库
+# sqlite3 是 Python 内置模块，无需安装
+
+# 文档处理
+python-docx>=1.0.0
+PyPDF2>=3.0.0
+pdfplumber>=0.10.0
+
+# 数据生成
+faker>=28.0.0
+
+# 配置管理
+python-dotenv>=1.0.0
+
+# 工具
+openpyxl>=3.1.0
+
+# RAG / 向量检索（轻量版用关键词匹配，无需外部模型）
+# 如需语义检索可安装: chromadb langchain-chroma langchain-huggingface sentence-transformers
+tiktoken>=0.7.0
