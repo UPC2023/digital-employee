@@ -194,40 +194,44 @@ def parse_resume_text(resume_text: str) -> dict:
     except Exception as e:
         print(f"[WARN] Structured Output 失败，尝试普通解析: {e}")
 
-    # 回退：普通调用 + 手动 JSON 解析
+    # 回退：普通调用 + 手动 JSON 解析（含正则兜底）
     import json
-    json_prompt = """请从以下简历文本中提取信息，严格按照以下JSON格式返回（不要包含其他文字，不要用markdown代码块）：
+    import re
+    json_prompt = """请从以下简历文本中提取信息，严格按照以下JSON格式返回。
 
-{
-  "name": "姓名",
-  "phone": "手机号",
-  "email": "邮箱",
-  "education": [{"school": "学校", "major": "专业", "degree": "学历", "start_date": "开始日期", "end_date": "结束日期"}],
-  "work_experience": [{"company": "公司", "position": "职位", "start_date": "开始日期", "end_date": "结束日期", "description": "工作描述"}],
-  "skills": ["技能1", "技能2"],
-  "self_evaluation": "自我评价",
-  "expected_salary": "期望薪资",
-  "current_salary": "当前薪资"
-}
+⚠️ 关键约束：
+- 只返回合法的 JSON 字符串，不要包含 Markdown 格式的 ```json ``` 标签
+- 不要有任何其他文字解析，不要加"好的"、"以下是"等前缀
+- JSON 内部的中文、英文、数字、符号必须合法转义
 
-找不到的字段留空字符串或空列表。
+返回格式示例：
+{"name":"姓名","phone":"手机号","email":"邮箱","education":[{"school":"学校","major":"专业","degree":"学历","start_date":"开始日期","end_date":"结束日期"}],"work_experience":[{"company":"公司","position":"职位","start_date":"开始日期","end_date":"结束日期","description":"工作描述"}],"skills":["技能1","技能2"],"self_evaluation":"自我评价","expected_salary":"期望薪资","current_salary":"当前薪资"}
+
+找不到的字段留空字符串""或空列表[]。
 
 简历文本：
 """ + resume_text[:3000]
 
     try:
         response = llm.invoke([
-            SystemMessage(content="你是简历解析助手，只返回JSON，不要其他文字。"),
+            SystemMessage(content="你是简历解析助手。你必须只返回合法的JSON对象，不要包含任何markdown标记、解释文字或额外前缀。"),
             HumanMessage(content=json_prompt),
         ])
         content = response.content.strip()
-        # 去除可能的 markdown 代码块标记
+        
+        # --- 第一层：去除 markdown 代码块标记 ---
         if content.startswith("```"):
             content = content.split("\n", 1)[1] if "\n" in content else content[3:]
         if content.endswith("```"):
             content = content[:-3]
         content = content.strip()
-        
+
+        # --- 第二层：正则兜底 —— 提取最外层 { ... } JSON 对象 ---
+        # 处理 DeepSeek 可能在 JSON 前后加解释文字的情况（如"好的，解析结果如下：{...}"）
+        json_match = re.search(r'\{.*\}', content, re.DOTALL)
+        if json_match:
+            content = json_match.group(0).strip()
+
         data = json.loads(content)
         # 确保必要字段存在
         data.setdefault("name", "")
@@ -238,8 +242,9 @@ def parse_resume_text(resume_text: str) -> dict:
         data.setdefault("skills", [])
         data.setdefault("self_evaluation", "")
         return data
-    except Exception as e:
-        print(f"[ERROR] JSON 解析也失败: {e}")
+    except (json.JSONDecodeError, Exception) as e:
+        print(f"[ERROR] JSON 解析失败 (含正则兜底): {e}")
+        print(f"[DEBUG] LLM 原始返回(前500字): {response.content[:500] if 'response' in dir() else 'N/A'}")
         return {
             "name": "",
             "phone": "",

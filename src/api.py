@@ -16,18 +16,59 @@ from typing import Optional, Any
 
 # 导入各子模块
 from .database import (
+    # 鉴权
+    verify_login,
+    change_password,
+    hash_password,
+    # 员工
     query_employee,
     get_employee_by_code,
+    create_employee,
     update_employee,
     get_department_members,
+    # 考勤
     query_attendance,
+    query_attendance_summary,
+    query_attendance_anomalies,
+    # 请假
     submit_leave,
+    approve_leave,
+    cancel_leave,
     query_leave_balance,
     query_leave_history,
+    query_pending_leaves,
+    # 薪酬
     query_payroll,
+    # 招聘
     query_recruitment,
     insert_recruitment,
     update_recruitment_status,
+    query_recruitment_pipeline,
+    # 面试
+    schedule_interview,
+    query_interviews,
+    update_interview_result,
+    # 入职任务
+    create_onboarding_tasks,
+    query_onboarding_tasks,
+    update_onboarding_task,
+    get_onboarding_progress,
+    # 通知日志
+    log_notification,
+    query_notification_logs,
+    # 审计日志
+    log_audit,
+    query_audit_logs,
+    # 数据备份
+    backup_database,
+    list_backups,
+    # 数据脱敏
+    mask_phone,
+    mask_email,
+    mask_id_card,
+    mask_salary,
+    mask_sensitive_data,
+    # 初始化
     init_database,
 )
 
@@ -140,19 +181,69 @@ def get_dashboard_summary() -> dict:
 # ============================================================
 
 __all__ = [
-    # 数据库操作
+    # 鉴权
+    "verify_login",
+    "change_password",
+    "hash_password",
+
+    # 员工
     "query_employee",
     "get_employee_by_code",
+    "create_employee",
     "update_employee",
     "get_department_members",
+
+    # 考勤
     "query_attendance",
+    "query_attendance_summary",
+    "query_attendance_anomalies",
+
+    # 请假
     "submit_leave",
+    "approve_leave",
+    "cancel_leave",
     "query_leave_balance",
     "query_leave_history",
+    "query_pending_leaves",
+
+    # 薪酬
     "query_payroll",
+
+    # 招聘
     "query_recruitment",
     "insert_recruitment",
     "update_recruitment_status",
+    "query_recruitment_pipeline",
+
+    # 面试
+    "schedule_interview",
+    "query_interviews",
+    "update_interview_result",
+
+    # 入职任务
+    "create_onboarding_tasks",
+    "query_onboarding_tasks",
+    "update_onboarding_task",
+    "get_onboarding_progress",
+
+    # 通知日志
+    "log_notification",
+    "query_notification_logs",
+
+    # 审计日志
+    "log_audit",
+    "query_audit_logs",
+
+    # 数据备份
+    "backup_database",
+    "list_backups",
+
+    # 数据脱敏
+    "mask_phone",
+    "mask_email",
+    "mask_id_card",
+    "mask_salary",
+    "mask_sensitive_data",
 
     # 业务逻辑
     "calculate_tax",

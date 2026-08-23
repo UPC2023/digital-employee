@@ -3,12 +3,20 @@
 返回值统一格式化为自然语言，便于 LLM 理解和转述。
 """
 import json
+from contextvars import ContextVar
+
 from langchain.tools import tool
 
 from src.api import (
-    query_employee, get_employee_by_code, update_employee, get_department_members,
+    query_employee, get_employee_by_code, create_employee, update_employee, get_department_members,
     query_attendance, submit_leave, query_leave_balance, query_leave_history,
+    approve_leave, cancel_leave, query_pending_leaves,
     query_payroll, query_recruitment, insert_recruitment, update_recruitment_status,
+    query_attendance_summary, query_attendance_anomalies,
+    schedule_interview, query_interviews, update_interview_result,
+    create_onboarding_tasks, query_onboarding_tasks, update_onboarding_task, get_onboarding_progress,
+    log_notification, query_notification_logs, log_audit, query_audit_logs,
+    backup_database, list_backups, mask_sensitive_data,
     calculate_tax, calculate_monthly_tax, calculate_social_insurance,
     calculate_annual_leave_days, calculate_workdays, calculate_salary_summary,
     parse_resume, batch_parse_resumes,
@@ -16,6 +24,55 @@ from src.api import (
     get_dashboard_summary,
 )
 from src.agent.rag import rag_search
+
+
+CURRENT_ROLE: ContextVar[str] = ContextVar("hr_agent_current_role", default="employee")
+CURRENT_EMPLOYEE_CODE: ContextVar[str] = ContextVar("hr_agent_employee_code", default="")
+CURRENT_EMPLOYEE_NAME: ContextVar[str] = ContextVar("hr_agent_employee_name", default="")
+CURRENT_DEPARTMENT: ContextVar[str] = ContextVar("hr_agent_department", default="")
+
+
+def set_tool_context(role: str = "employee", employee_code: str = "", employee_name: str = "", department: str = ""):
+    """为当前一次 Agent 调用注入身份上下文。"""
+    return (
+        CURRENT_ROLE.set((role or "employee").lower()),
+        CURRENT_EMPLOYEE_CODE.set(employee_code or ""),
+        CURRENT_EMPLOYEE_NAME.set(employee_name or ""),
+        CURRENT_DEPARTMENT.set(department or ""),
+    )
+
+
+def reset_tool_context(tokens) -> None:
+    """恢复上一次的上下文。"""
+    current_role, current_employee_code, current_employee_name, current_department = tokens
+    CURRENT_ROLE.reset(current_role)
+    CURRENT_EMPLOYEE_CODE.reset(current_employee_code)
+    CURRENT_EMPLOYEE_NAME.reset(current_employee_name)
+    CURRENT_DEPARTMENT.reset(current_department)
+
+
+def get_tool_context() -> dict:
+    return {
+        "role": CURRENT_ROLE.get(),
+        "employee_code": CURRENT_EMPLOYEE_CODE.get(),
+        "employee_name": CURRENT_EMPLOYEE_NAME.get(),
+        "department": CURRENT_DEPARTMENT.get(),
+    }
+
+
+def _resolve_employee_code(employee_code: str = None) -> str:
+    """员工自助场景默认回落到当前登录工号。"""
+    current_code = CURRENT_EMPLOYEE_CODE.get()
+    current_role = CURRENT_ROLE.get()
+    if current_role == "employee":
+        return current_code or (employee_code or "")
+    return employee_code or current_code or ""
+
+
+def _maybe_mask(value):
+    if CURRENT_ROLE.get() == "employee":
+        return mask_sensitive_data(value, role="employee")
+    return value
 
 
 def _fmt_employee(emp):
@@ -47,6 +104,7 @@ def employee_query_tool(employee_code: str = None, name: str = None, department:
         results = query_employee(employee_code=employee_code, name=name, department=department)
         if not results:
             return "未找到匹配的员工信息。"
+        results = _maybe_mask(results)
         lines = [f"共查询到 {len(results)} 名员工：\n"]
         for i, emp in enumerate(results, 1):
             lines.append(
@@ -60,10 +118,12 @@ def employee_query_tool(employee_code: str = None, name: str = None, department:
 
 
 @tool
-def employee_detail_tool(employee_code: str) -> str:
-    """按工号精确查询单个员工详情。参数 employee_code 为工号，如 EMP001。"""
+def employee_detail_tool(employee_code: str = None) -> str:
+    """按工号精确查询单个员工详情。员工角色下可不传 employee_code，默认查询当前登录用户。"""
     try:
+        employee_code = _resolve_employee_code(employee_code)
         emp = get_employee_by_code(employee_code)
+        emp = _maybe_mask(emp)
         return _fmt_employee(emp) if emp else f"未找到工号为 {employee_code} 的员工。"
     except Exception as e:
         return f"查询失败: {e}"
@@ -121,12 +181,17 @@ def tool_update_employee(employee_code: str, phone: str = None) -> str:
 
 # ---------------- 考勤 ----------------
 @tool
-def attendance_query_tool(employee_code: str, start_date: str, end_date: str) -> str:
-    """查询员工考勤记录。
+def attendance_query_tool(employee_code: str = None, start_date: str = None, end_date: str = None) -> str:
+    """查询员工考勤记录。员工角色下可不传 employee_code，默认查询当前登录用户。
     ⚠️ start_date 和 end_date 必填，格式 'YYYY-MM-DD'！
     用户说"上个月"→假设今天是2026-07，填 start_date="2026-06-01", end_date="2026-06-30"。
     用户说"最近一周"→按当天往前推7天计算。
     参数：employee_code 工号(如 EMP001)；start_date 起始日期；end_date 结束日期。"""
+    employee_code = _resolve_employee_code(employee_code)
+    if not employee_code:
+        return "请先提供员工工号，或在员工端登录后再查询自己的考勤。"
+    if not start_date or not end_date:
+        return "请提供完整的起止日期，格式为 YYYY-MM-DD。"
     employee_code = str(employee_code).strip()
     s_date = str(start_date)
     if len(s_date) == 7:
@@ -163,9 +228,12 @@ def attendance_query_tool(employee_code: str, start_date: str, end_date: str) ->
 
 # ---------------- 请假 ----------------
 @tool
-def leave_balance_tool(employee_code: str) -> str:
-    """查询员工各类假期剩余天数。参数 employee_code 为工号，如 EMP001。"""
+def leave_balance_tool(employee_code: str = None) -> str:
+    """查询员工各类假期剩余天数。员工角色下可不传 employee_code，默认查询当前登录用户。"""
     try:
+        employee_code = _resolve_employee_code(employee_code)
+        if not employee_code:
+            return "请先提供员工工号，或在员工端登录后再查询自己的假期余额。"
         result = query_leave_balance(employee_code)
         if isinstance(result, dict):
             balances = result.get("balances", result)
@@ -180,9 +248,12 @@ def leave_balance_tool(employee_code: str) -> str:
 
 
 @tool
-def leave_history_tool(employee_code: str, status: str = None) -> str:
-    """查询员工请假历史。参数 employee_code 为工号；status 可选：待审批/已批准/已驳回。"""
+def leave_history_tool(employee_code: str = None, status: str = None) -> str:
+    """查询员工请假历史。员工角色下可不传 employee_code，默认查询当前登录用户。status 可选：待审批/已批准/已驳回。"""
     try:
+        employee_code = _resolve_employee_code(employee_code)
+        if not employee_code:
+            return "请先提供员工工号，或在员工端登录后再查询自己的请假历史。"
         result = query_leave_history(employee_code, status)
         if not result:
             return f"员工 {employee_code} 无请假记录。"
@@ -199,11 +270,16 @@ def leave_history_tool(employee_code: str, status: str = None) -> str:
 
 
 @tool
-def leave_submit_tool(employee_code: str, leave_type: str, start_date: str, end_date: str, reason: str) -> str:
+def leave_submit_tool(employee_code: str = None, leave_type: str = None, start_date: str = None, end_date: str = None, reason: str = None) -> str:
     """⚠️ 有副作用：会写入数据库并扣减假期余额，调用前务必向用户确认参数无误。
     帮员工提交请假申请。leave_type 必须是以下之一：年假/事假/病假/婚假/产假/调休。
     日期格式 YYYY-MM-DD。系统会自动计算请假天数并检查余额。"""
     try:
+        employee_code = _resolve_employee_code(employee_code)
+        if not employee_code:
+            return "请先提供员工工号，或在员工端登录后再提交自己的请假申请。"
+        if not all([leave_type, start_date, end_date, reason]):
+            return "请补全请假类型、开始日期、结束日期和原因。"
         result = submit_leave(employee_code, leave_type, start_date, end_date, reason)
         if isinstance(result, dict) and result.get("success"):
             bal = result.get("remaining_balance", {})
@@ -220,12 +296,16 @@ def leave_submit_tool(employee_code: str, leave_type: str, start_date: str, end_
 
 # ---------------- 薪酬 / 个税 ----------------
 @tool
-def payroll_query_tool(employee_code: str, year: int = None, month: int = None) -> str:
-    """查询工资明细。参数 employee_code 为工号；year/month 为整数(如 2026, 6)，不传默认最近3个月。"""
+def payroll_query_tool(employee_code: str = None, year: int = None, month: int = None) -> str:
+    """查询工资明细。员工角色下可不传 employee_code，默认查询当前登录用户；year/month 为整数(如 2026, 6)，不传默认最近3个月。"""
     try:
+        employee_code = _resolve_employee_code(employee_code)
+        if not employee_code:
+            return "请先提供员工工号，或在员工端登录后再查询自己的工资明细。"
         result = query_payroll(employee_code, year, month)
         if not result:
             return f"员工 {employee_code} 无薪酬记录。"
+        result = _maybe_mask(result)
         lines = [f"员工 {employee_code} 共 {len(result)} 个月薪记录：\n"]
         for r in result:
             lines.append(
@@ -242,9 +322,12 @@ def payroll_query_tool(employee_code: str, year: int = None, month: int = None) 
 
 
 @tool
-def payroll_summary_tool(employee_code: str, year: int = None, month: int = None) -> str:
-    """汇总某员工薪酬统计(平均/总额等)。参数同 payroll_query_tool。"""
+def payroll_summary_tool(employee_code: str = None, year: int = None, month: int = None) -> str:
+    """汇总某员工薪酬统计(平均/总额等)。员工角色下可不传 employee_code，默认查询当前登录用户。"""
     try:
+        employee_code = _resolve_employee_code(employee_code)
+        if not employee_code:
+            return "请先提供员工工号，或在员工端登录后再查询自己的薪酬汇总。"
         recs = query_payroll(employee_code, year, month)
         if not recs:
             return f"员工 {employee_code} 无薪酬记录。"
@@ -354,6 +437,286 @@ def recruitment_query_tool(position: str = None, status: str = None, candidate_n
                 f"经验:{r.get('years_of_exp','') or '?'}年"
             )
         return "\n".join(lines)
+    except Exception as e:
+        return f"查询失败: {e}"
+
+
+# ---------------- 角色B 新增：RBAC / SOP 工具 ----------------
+@tool
+def employee_create_tool(
+    name: str,
+    department: str,
+    position: str,
+    hire_date: str,
+    gender: str = None,
+    phone: str = None,
+    email: str = None,
+    education: str = None,
+    school: str = None,
+    major: str = None,
+    address: str = None,
+    emergency_contact: str = None,
+    emergency_phone: str = None,
+) -> str:
+    """⚠️ 有副作用：创建新员工并自动生成初始密码和入职任务。"""
+    try:
+        payload = {
+            "name": name,
+            "department": department,
+            "position": position,
+            "hire_date": hire_date,
+            "gender": gender,
+            "phone": phone,
+            "email": email,
+            "education": education,
+            "school": school,
+            "major": major,
+            "address": address,
+            "emergency_contact": emergency_contact,
+            "emergency_phone": emergency_phone,
+        }
+        payload = {key: value for key, value in payload.items() if value is not None}
+        result = create_employee(payload)
+        if result.get("success"):
+            employee_code = result.get("employee_code")
+            task_count = create_onboarding_tasks(employee_code) if employee_code else 0
+            return (
+                f"✅ 新员工已创建\n"
+                f"工号: {employee_code}\n"
+                f"姓名: {name}\n"
+                f"部门: {department}\n"
+                f"职位: {position}\n"
+                f"初始密码: 123456\n"
+                f"入职任务: {task_count} 项"
+            )
+        return f"❌ 创建失败: {result.get('message', '未知错误')}"
+    except Exception as e:
+        return f"❌ 创建失败: {e}"
+
+
+@tool
+def employee_offboard_tool(employee_code: str, leave_date: str = None, status: str = "离职") -> str:
+    """⚠️ 有副作用：办理离职并更新离职日期/状态。"""
+    try:
+        updates = {"status": status}
+        if leave_date:
+            updates["leave_date"] = leave_date
+        ok = update_employee(employee_code, **updates)
+        if ok:
+            return f"✅ 员工 {employee_code} 已更新为 {status}，离职日期: {leave_date or '未填写'}"
+        return f"❌ 未找到工号 {employee_code} 或更新失败"
+    except Exception as e:
+        return f"❌ 离职办理失败: {e}"
+
+
+@tool
+def leave_approve_tool(leave_id: int, approver_code: str, approved: bool, reject_reason: str = None) -> str:
+    """⚠️ 有副作用：审批请假申请。approved=True 表示批准，False 表示驳回。"""
+    try:
+        result = approve_leave(int(leave_id), approver_code, bool(approved), reject_reason)
+        if result.get("success"):
+            return f"✅ {result.get('message', '')}"
+        return f"❌ 审批失败: {result.get('message', '未知错误')}"
+    except Exception as e:
+        return f"❌ 审批失败: {e}"
+
+
+@tool
+def leave_cancel_tool(leave_id: int, employee_code: str = None) -> str:
+    """⚠️ 有副作用：撤销待审批请假申请。员工角色下可不传 employee_code，默认撤销自己的申请。"""
+    try:
+        employee_code = _resolve_employee_code(employee_code)
+        if not employee_code:
+            return "请提供员工工号，或在员工端登录后再撤销自己的请假申请。"
+        result = cancel_leave(int(leave_id), employee_code)
+        return f"✅ {result.get('message', '')}" if result.get("success") else f"❌ 撤销失败: {result.get('message', '')}"
+    except Exception as e:
+        return f"❌ 撤销失败: {e}"
+
+
+@tool
+def pending_leave_query_tool() -> str:
+    """🆕 查询公司所有待审批的请假申请（管理端全局工具，无需参数）。
+    返回每条申请的ID、员工姓名、工号、部门、请假类型、日期、天数、原因。
+    用于：HR管理员查看"今天有哪些请假需要我审批"。
+    ⚠️ 与 leave_history_tool 不同：本工具一次性拉取全公司待审批记录，禁止逐员工遍历！"""
+    try:
+        result = query_pending_leaves()
+        if not result:
+            return "✅ 目前没有待审批的请假申请。"
+        lines = [f"📋 全公司待审批请假申请共 {len(result)} 条：\n"]
+        for r in result:
+            date_range = f"{r.get('start_date','')} ~ {r.get('end_date','')}"
+            lines.append(
+                f"  ID:{r.get('id','')} | {r.get('employee_name','')} "
+                f"(工号:{r.get('employee_code','')} | {r.get('department','')}) | "
+                f"{r.get('leave_type','')} | {date_range} | {r.get('total_days',0)}天 | "
+                f"原因:{r.get('reason','') or '无'}"
+            )
+        return "\n".join(lines)
+    except Exception as e:
+        return f"❌ 查询失败: {e}"
+
+
+@tool
+def recruitment_pipeline_tool() -> str:
+    """查询招聘管道全景统计。"""
+    try:
+        result = query_recruitment_pipeline()
+        if not result:
+            return "暂无招聘管道数据。"
+        lines = [f"招聘管道总览：活跃候选人 {result.get('total_active', 0)} 人\n"]
+        for item in result.get("pipeline", []):
+            lines.append(f"  {item.get('status', '')}: {item.get('count', 0)} 人")
+        return "\n".join(lines)
+    except Exception as e:
+        return f"查询失败: {e}"
+
+
+@tool
+def attendance_summary_tool(department: str = None, start_date: str = None, end_date: str = None) -> str:
+    """查询部门或全公司考勤汇总。"""
+    try:
+        result = query_attendance_summary(department, start_date, end_date)
+        if not result:
+            return "暂无考勤汇总数据。"
+        return json.dumps(result, ensure_ascii=False, indent=2)
+    except Exception as e:
+        return f"查询失败: {e}"
+
+
+@tool
+def attendance_anomaly_tool(employee_code: str = None, days: int = 30) -> str:
+    """查询员工或全公司的考勤异常。"""
+    try:
+        employee_code = _resolve_employee_code(employee_code)
+        result = query_attendance_anomalies(employee_code or None, days)
+        if not result:
+            return "未发现考勤异常。"
+        return json.dumps(result, ensure_ascii=False, indent=2)
+    except Exception as e:
+        return f"查询失败: {e}"
+
+
+@tool
+def interview_schedule_tool(
+    recruitment_id: int,
+    round: str,
+    interview_date: str,
+    interviewer_code: str,
+    location: str = None,
+    notes: str = None,
+) -> str:
+    """⚠️ 有副作用：安排面试并写入 interviews 表。"""
+    try:
+        result = schedule_interview(int(recruitment_id), round, interview_date, interviewer_code, location, notes)
+        return f"✅ {result.get('message', '')}" if result.get("success") else f"❌ 安排失败: {result.get('message', '')}"
+    except Exception as e:
+        return f"❌ 安排失败: {e}"
+
+
+@tool
+def interview_result_tool(interview_id: int, result: str, notes: str = None) -> str:
+    """⚠️ 有副作用：更新面试结果。"""
+    try:
+        resp = update_interview_result(int(interview_id), result, notes)
+        return f"✅ {resp.get('message', '')}" if resp.get("success") else f"❌ 记录失败: {resp.get('message', '')}"
+    except Exception as e:
+        return f"❌ 记录失败: {e}"
+
+
+@tool
+def query_interviews_tool(recruitment_id: int = None, interviewer_code: str = None, status: str = None) -> str:
+    """查询面试记录。"""
+    try:
+        result = query_interviews(recruitment_id, interviewer_code, status)
+        if not result:
+            return "未找到匹配的面试记录。"
+        return json.dumps(result, ensure_ascii=False, indent=2)
+    except Exception as e:
+        return f"查询失败: {e}"
+
+
+@tool
+def onboarding_tasks_query_tool(employee_code: str) -> str:
+    """查询入职任务列表。"""
+    try:
+        result = query_onboarding_tasks(employee_code)
+        if not result:
+            return f"员工 {employee_code} 暂无入职任务。"
+        return json.dumps(result, ensure_ascii=False, indent=2)
+    except Exception as e:
+        return f"查询失败: {e}"
+
+
+@tool
+def onboarding_task_update_tool(task_id: int, completed: bool) -> str:
+    """更新入职任务完成状态。"""
+    try:
+        result = update_onboarding_task(int(task_id), bool(completed))
+        return f"✅ 任务 {result.get('task_id', task_id)} 已更新为 {result.get('status', '')}" if result.get("success") else f"❌ 更新失败: {result}"
+    except Exception as e:
+        return f"❌ 更新失败: {e}"
+
+
+@tool
+def onboarding_progress_tool(employee_code: str) -> str:
+    """查询入职进度。"""
+    try:
+        result = get_onboarding_progress(employee_code)
+        return json.dumps(result, ensure_ascii=False, indent=2)
+    except Exception as e:
+        return f"查询失败: {e}"
+
+
+@tool
+def notification_send_tool(type: str, recipient: str, subject: str, content: str, status: str = "sent", error_msg: str = None) -> str:
+    """记录一条通知发送日志，供邮件/企微/钉钉发送结果回写。"""
+    try:
+        log_id = log_notification(type, recipient, subject, content, status, error_msg)
+        return f"✅ 通知已记录，日志 ID: {log_id}"
+    except Exception as e:
+        return f"❌ 记录失败: {e}"
+
+
+@tool
+def notification_logs_tool(limit: int = 20) -> str:
+    """查询通知发送日志。"""
+    try:
+        result = query_notification_logs(limit)
+        return json.dumps(result, ensure_ascii=False, indent=2)
+    except Exception as e:
+        return f"查询失败: {e}"
+
+
+@tool
+def audit_query_tool(operator_code: str = None, action: str = None, target_table: str = None, limit: int = 50) -> str:
+    """查询审计日志。"""
+    try:
+        result = query_audit_logs(operator_code, action, target_table, limit)
+        return json.dumps(result, ensure_ascii=False, indent=2)
+    except Exception as e:
+        return f"查询失败: {e}"
+
+
+@tool
+def backup_tool(backup_dir: str = None) -> str:
+    """执行数据库备份。"""
+    try:
+        result = backup_database(backup_dir)
+        if result.get("success"):
+            return f"✅ 数据库备份成功：{result.get('backup_path', '')}"
+        return f"❌ 备份失败: {result.get('message', '未知错误')}"
+    except Exception as e:
+        return f"❌ 备份失败: {e}"
+
+
+@tool
+def backup_list_tool(backup_dir: str = None) -> str:
+    """列出历史备份文件。"""
+    try:
+        result = list_backups(backup_dir)
+        return json.dumps(result, ensure_ascii=False, indent=2)
     except Exception as e:
         return f"查询失败: {e}"
 
@@ -515,6 +878,13 @@ ALL_TOOLS = [
     employee_query_tool, employee_detail_tool, department_members_tool, employee_update_tool, tool_update_employee,
     attendance_query_tool,
     leave_balance_tool, leave_history_tool, leave_submit_tool,
+    employee_create_tool, employee_offboard_tool, leave_approve_tool, leave_cancel_tool,
+    pending_leave_query_tool,
+    recruitment_pipeline_tool, attendance_summary_tool, attendance_anomaly_tool,
+    interview_schedule_tool, interview_result_tool, query_interviews_tool,
+    onboarding_tasks_query_tool, onboarding_task_update_tool, onboarding_progress_tool,
+    notification_send_tool, notification_logs_tool, audit_query_tool,
+    backup_tool, backup_list_tool,
     payroll_query_tool, payroll_summary_tool, tax_monthly_tool, tax_accumulated_tool,
     social_insurance_tool, annual_leave_tool, workdays_tool,
     recruitment_query_tool, recruitment_create_tool, recruitment_update_tool,
